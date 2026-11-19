@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE (per-user state)
+.idea/workspace.xml
+visualization/live_component/plotly.min.js

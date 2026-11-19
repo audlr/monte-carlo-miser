@@ -1,697 +1,354 @@
-import time
-from concurrent.futures import ThreadPoolExecutor
+"""
+Monte Carlo vs MISER Integration — Streamlit UI.
 
-import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+UI 전용 파일. 알고리즘은 miser.py, 기준값/실험 반복은 experiments.py,
+그래프는 visualization/plots.py, 실시간 원 샘플링 애니메이션은
+visualization/live.py (+ live_component/index.html) 에 있다.
+
+적분 대상: 단위정사각형 안의 원(원래 데모의 원, 중심 (0.70, 0.30), r = 0.15)에
+대한 지시함수 f(x, y) = 1 if inside else 0. 적분값 = 원의 넓이 = π r².
+
+실행 흐름: 사이드바 Run Comparison → 두 알고리즘 실행 → 새 run_id 로 애니메이션
+자동 시작 → 애니메이션이 끝나면 컴포넌트가 run_id 를 돌려줌 → 최종 통계 표시.
+"""
+
 import streamlit as st
 
-
-# ============================================================
-# Monte Carlo vs MISER - Interactive Streamlit Demonstration
-# ============================================================
-
-st.set_page_config(
-    page_title="Monte Carlo vs MISER",
-    page_icon="📊",
-    layout="wide",
+from experiments import (
+    INTEGRANDS,
+    SWEEP_SIZES,
+    errors,
+    make_bounds,
+    regions_at_depth,
+    repeated,
+    run_pair,
+    seeds_for,
+    sweep,
 )
+from visualization import live, plots
 
-VILLAGE_X = 0.70
-VILLAGE_Y = 0.30
-VILLAGE_RADIUS = 0.15
-SIGMA = 0.055
+CIRCLE = INTEGRANDS["circle"]
+BOUNDS = make_bounds(CIRCLE, 0, 1)
+REFERENCE = CIRCLE.reference(BOUNDS)
+CX, CY, R = CIRCLE.circle
 
-
-def density(x, y):
-    """Smooth house-density model concentrated near the village."""
-    d2 = (x - VILLAGE_X) ** 2 + (y - VILLAGE_Y) ** 2
-    return 0.001 + np.exp(-d2 / (2.0 * SIGMA**2))
-
-
-def in_village(points):
-    d2 = (
-        (points[:, 0] - VILLAGE_X) ** 2
-        + (points[:, 1] - VILLAGE_Y) ** 2
-    )
-    return d2 <= VILLAGE_RADIUS**2
-
-
-def reference_integral(grid_size=650):
-    """Numerical reference value for the integral over the unit square."""
-    axis = np.linspace(0.0, 1.0, grid_size)
-    xx, yy = np.meshgrid(axis, axis)
-    return float(np.mean(density(xx, yy)))
-
-
-def run_plain_monte_carlo(n, seed):
-    """Uniform sampling over the complete unit square."""
-    start = time.perf_counter()
-    rng = np.random.default_rng(seed)
-
-    points = rng.random((n, 2))
-    values = density(points[:, 0], points[:, 1])
-    estimate = float(np.mean(values))
-
-    elapsed = time.perf_counter() - start
-    return {
-        "points": points,
-        "values": values,
-        "estimate": estimate,
-        "elapsed": elapsed,
-    }
-
-
-def run_miser(n, seed, leaf_size=300):
-    """
-    MISER-style recursive stratified Monte Carlo.
-
-    At each internal node:
-      1) Pilot samples estimate variance in both halves of x and y.
-      2) The axis with the lower estimated split cost is selected.
-      3) The remaining samples are allocated according to
-         subregion area * standard deviation.
-      4) The two subregions are integrated recursively.
-
-    Pilot evaluations count toward the total evaluation budget.
-    The independent production samples are used for the integral estimate.
-    """
-    start = time.perf_counter()
-    rng = np.random.default_rng(seed)
-
-    all_points = []
-    all_kinds = []  # 0 = pilot, 1 = final/production
-    split_events = []
-    evaluation_count = 0
-
-    def draw(box, count):
-        x0, x1 = box[0]
-        y0, y1 = box[1]
-        pts = np.empty((count, 2), dtype=float)
-        pts[:, 0] = rng.uniform(x0, x1, count)
-        pts[:, 1] = rng.uniform(y0, y1, count)
-        return pts
-
-    def box_area(box):
-        return (
-            (box[0][1] - box[0][0])
-            * (box[1][1] - box[1][0])
-        )
-
-    def add_points(points, kind):
-        nonlocal evaluation_count
-        all_points.append(points)
-        all_kinds.append(np.full(len(points), kind, dtype=np.int8))
-        evaluation_count += len(points)
-
-    def leaf_estimate(box, count):
-        pts = draw(box, count)
-        vals = density(pts[:, 0], pts[:, 1])
-        add_points(pts, 1)
-        return box_area(box) * float(np.mean(vals))
-
-    def recurse(box, count, depth=0):
-        nonlocal evaluation_count
-
-        # Pilot samples: m points in each half for x and y tests.
-        m = min(16, max(8, count // 80))
-        pilot_cost = 4 * m
-
-        # Stop if the region is too small for a reliable split.
-        if count <= 2 * leaf_size + pilot_cost or depth >= 12:
-            return leaf_estimate(box, count)
-
-        axis_tests = []
-
-        for axis in (0, 1):
-            midpoint = (box[axis][0] + box[axis][1]) / 2.0
-
-            left_box = [list(box[0]), list(box[1])]
-            right_box = [list(box[0]), list(box[1])]
-            left_box[axis][1] = midpoint
-            right_box[axis][0] = midpoint
-
-            left_pilot = draw(left_box, m)
-            right_pilot = draw(right_box, m)
-            add_points(left_pilot, 0)
-            add_points(right_pilot, 0)
-
-            left_values = density(left_pilot[:, 0], left_pilot[:, 1])
-            right_values = density(right_pilot[:, 0], right_pilot[:, 1])
-
-            var_left = float(np.var(left_values, ddof=1))
-            var_right = float(np.var(right_values, ddof=1))
-
-            # Equal-area halves: compare the variance-based split cost.
-            split_cost = (var_left ** (1 / 3) + var_right ** (1 / 3)) ** 3
-
-            axis_tests.append({
-                "axis": axis,
-                "midpoint": midpoint,
-                "left_box": left_box,
-                "right_box": right_box,
-                "var_left": var_left,
-                "var_right": var_right,
-                "cost": split_cost,
-            })
-
-        best = min(axis_tests, key=lambda item: item["cost"])
-        remaining = count - pilot_cost
-
-        # Allocate more production samples to the half with larger
-        # estimated standard deviation (the two halves have equal area).
-        weight_left = np.sqrt(max(best["var_left"], 0.0))
-        weight_right = np.sqrt(max(best["var_right"], 0.0))
-        weight_sum = weight_left + weight_right
-
-        if weight_sum <= 1e-15:
-            n_left = remaining // 2
-        else:
-            n_left = int(round(remaining * weight_left / weight_sum))
-
-        n_left = max(leaf_size, min(n_left, remaining - leaf_size))
-        n_right = remaining - n_left
-
-        split_events.append({
-            "axis": best["axis"],
-            "midpoint": best["midpoint"],
-            "box": [list(box[0]), list(box[1])],
-            "depth": depth,
-            "after_eval": evaluation_count,
-        })
-
-        left_integral = recurse(best["left_box"], n_left, depth + 1)
-        right_integral = recurse(best["right_box"], n_right, depth + 1)
-        return left_integral + right_integral
-
-    initial_box = [[0.0, 1.0], [0.0, 1.0]]
-    estimate = recurse(initial_box, n)
-
-    points = np.vstack(all_points)
-    kinds = np.concatenate(all_kinds)
-    values = density(points[:, 0], points[:, 1])
-
-    elapsed = time.perf_counter() - start
-
-    # Defensive assertion: every requested function evaluation is counted.
-    assert evaluation_count == n, (evaluation_count, n)
-
-    return {
-        "points": points,
-        "values": values,
-        "kinds": kinds,
-        "estimate": float(estimate),
-        "elapsed": elapsed,
-        "splits": split_events,
-        "evaluations": evaluation_count,
-    }
-
-
-def make_animated_figure(mc, miser, n, frame_count, frame_duration_ms):
-    """Build one synchronized Plotly animation with two side-by-side panels."""
-    mc_points = mc["points"]
-    miser_points = miser["points"]
-
-    fig = make_subplots(
-        rows=1,
-        cols=2,
-        subplot_titles=(
-            "Plain Monte Carlo — uniform sampling",
-            "MISER — adaptive subdivision",
-        ),
-        horizontal_spacing=0.10,
-    )
-
-    # Initial traces. Each algorithm's points are revealed frame by frame.
-    fig.add_trace(
-        go.Scattergl(
-            x=[],
-            y=[],
-            mode="markers",
-            name="MC samples",
-            marker=dict(size=4, color="#4C9BE8", opacity=0.55),
-            showlegend=False,
-        ),
-        row=1, col=1,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=[], y=[],
-            mode="lines",
-            name="Village boundary",
-            line=dict(color="#202020", width=2),
-            showlegend=False,
-            hoverinfo="skip",
-        ),
-        row=1, col=1,
-    )
-
-    fig.add_trace(
-        go.Scattergl(
-            x=[],
-            y=[],
-            mode="markers",
-            name="MISER samples",
-            marker=dict(size=4, color="#E8754F", opacity=0.58),
-            showlegend=False,
-        ),
-        row=1, col=2,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=[], y=[],
-            mode="lines",
-            name="Village boundary",
-            line=dict(color="#202020", width=2),
-            showlegend=False,
-            hoverinfo="skip",
-        ),
-        row=1, col=2,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=[], y=[],
-            mode="lines",
-            name="MISER split boundaries",
-            line=dict(color="#C56A19", width=1.5),
-            showlegend=False,
-            hoverinfo="skip",
-        ),
-        row=1, col=2,
-    )
-
-    # Village circles are drawn as line traces so both panels use identical axes.
-    theta = np.linspace(0, 2 * np.pi, 180)
-    circle_x = VILLAGE_X + VILLAGE_RADIUS * np.cos(theta)
-    circle_y = VILLAGE_Y + VILLAGE_RADIUS * np.sin(theta)
-
-    fig.data[1].x = circle_x
-    fig.data[1].y = circle_y
-    fig.data[3].x = circle_x
-    fig.data[3].y = circle_y
-
-    # Axis ranges and labels.
-    fig.update_xaxes(range=[0, 1], title_text="X", row=1, col=1)
-    fig.update_yaxes(range=[0, 1], title_text="Y", row=1, col=1, scaleanchor="x")
-    fig.update_xaxes(range=[0, 1], title_text="X", row=1, col=2)
-    fig.update_yaxes(range=[0, 1], title_text="Y", row=1, col=2, scaleanchor="x2")
-
-    frames = []
-    frame_indices = np.unique(
-        np.linspace(1, n, min(frame_count, n), dtype=int)
-    )
-
-    split_events = miser["splits"]
-
-    for frame_number, end in enumerate(frame_indices):
-        mc_slice = mc_points[:end]
-        miser_slice = miser_points[:end]
-
-        # Display MISER split lines only after the corresponding pilot phase.
-        line_x, line_y = [], []
-        for event in split_events:
-            if event["after_eval"] <= end:
-                box = event["box"]
-                if event["axis"] == 0:
-                    x = event["midpoint"]
-                    line_x.extend([x, x, None])
-                    line_y.extend([box[1][0], box[1][1], None])
-                else:
-                    y = event["midpoint"]
-                    line_x.extend([box[0][0], box[0][1], None])
-                    line_y.extend([y, y, None])
-
-        mc_village_pct = (
-            float(np.mean(in_village(mc_slice)) * 100)
-            if len(mc_slice) else 0.0
-        )
-        miser_village_pct = (
-            float(np.mean(in_village(miser_slice)) * 100)
-            if len(miser_slice) else 0.0
-        )
-
-        mc_text = (
-            f"Samples shown: {end:,}/{n:,}<br>"
-            f"Measured runtime: {mc['elapsed']:.5f} s<br>"
-            f"Final estimate: {mc['estimate']:.6f}<br>"
-            f"Village sample ratio: {mc_village_pct:.1f}%"
-        )
-        miser_text = (
-            f"Evaluations shown: {end:,}/{n:,}<br>"
-            f"Measured runtime: {miser['elapsed']:.5f} s<br>"
-            f"Final estimate: {miser['estimate']:.6f}<br>"
-            f"Village sample ratio: {miser_village_pct:.1f}%"
-        )
-
-        frames.append(
-            go.Frame(
-                name=str(frame_number),
-                data=[
-                    go.Scattergl(x=mc_slice[:, 0], y=mc_slice[:, 1]),
-                    go.Scattergl(x=miser_slice[:, 0], y=miser_slice[:, 1]),
-                    go.Scatter(x=line_x, y=line_y),
-                ],
-                traces=[0, 2, 4],
-                layout=go.Layout(
-                    annotations=[
-                        dict(
-                            text=mc_text,
-                            x=0.02, y=0.98,
-                            xref="x domain", yref="y domain",
-                            xanchor="left", yanchor="top",
-                            showarrow=False,
-                            bgcolor="rgba(255,255,255,0.88)",
-                            bordercolor="#B7C7D8",
-                            borderwidth=1,
-                            font=dict(size=10),
-                        ),
-                        dict(
-                            text=miser_text,
-                            x=0.02, y=0.98,
-                            xref="x2 domain", yref="y2 domain",
-                            xanchor="left", yanchor="top",
-                            showarrow=False,
-                            bgcolor="rgba(255,255,255,0.88)",
-                            bordercolor="#E2B79E",
-                            borderwidth=1,
-                            font=dict(size=10),
-                        ),
-                    ]
-                ),
-            )
-        )
-
-    fig.frames = frames
-
-    slider_steps = [
-        {
-            "args": [
-                [str(i)],
-                {
-                    "frame": {"duration": frame_duration_ms, "redraw": True},
-                    "mode": "immediate",
-                    "transition": {"duration": 0},
-                },
-            ],
-            "label": f"{int(frame_indices[i]):,}",
-            "method": "animate",
-        }
-        for i in range(len(frame_indices))
-    ]
-
-    fig.update_layout(
-        height=650,
-        margin=dict(l=35, r=25, t=80, b=95),
-        title=dict(
-            text="Monte Carlo vs MISER — synchronized sampling process",
-            x=0.5,
-            xanchor="center",
-        ),
-        template="plotly_white",
-        updatemenus=[
-            {
-                "type": "buttons",
-                "direction": "left",
-                "x": 0.05,
-                "y": -0.16,
-                "showactive": False,
-                "buttons": [
-                    {
-                        "label": "▶ Start / Resume",
-                        "method": "animate",
-                        "args": [
-                            None,
-                            {
-                                "frame": {"duration": frame_duration_ms, "redraw": True},
-                                "transition": {"duration": 0},
-                                "fromcurrent": True,
-                                "mode": "immediate",
-                            },
-                        ],
-                    },
-                    {
-                        "label": "Ⅱ Pause",
-                        "method": "animate",
-                        "args": [
-                            [None],
-                            {
-                                "frame": {"duration": 0, "redraw": False},
-                                "mode": "immediate",
-                                "transition": {"duration": 0},
-                            },
-                        ],
-                    },
-                ],
-            }
-        ],
-        sliders=[
-            {
-                "active": 0,
-                "currentvalue": {"prefix": "Evaluations shown: "},
-                "pad": {"t": 45},
-                "steps": slider_steps,
-            }
-        ],
-    )
-
-    # Initial annotations, visible before the user presses Play.
-    fig.update_layout(
-        annotations=list(fig.layout.annotations) + [
-            dict(
-                text=(
-                    f"Samples shown: 0/{n:,}<br>"
-                    f"Measured runtime: {mc['elapsed']:.5f} s<br>"
-                    f"Final estimate: {mc['estimate']:.6f}"
-                ),
-                x=0.02, y=0.98,
-                xref="x domain", yref="y domain",
-                xanchor="left", yanchor="top",
-                showarrow=False,
-                bgcolor="rgba(255,255,255,0.88)",
-                bordercolor="#B7C7D8",
-                borderwidth=1,
-                font=dict(size=10),
-            ),
-            dict(
-                text=(
-                    f"Evaluations shown: 0/{n:,}<br>"
-                    f"Measured runtime: {miser['elapsed']:.5f} s<br>"
-                    f"Final estimate: {miser['estimate']:.6f}"
-                ),
-                x=0.02, y=0.98,
-                xref="x2 domain", yref="y2 domain",
-                xanchor="left", yanchor="top",
-                showarrow=False,
-                bgcolor="rgba(255,255,255,0.88)",
-                bordercolor="#E2B79E",
-                borderwidth=1,
-                font=dict(size=10),
-            ),
-        ]
-    )
-
-    return fig
-
-
-def metric_row(label, mc_value, miser_value):
-    c1, c2, c3 = st.columns([1.25, 1, 1])
-    c1.markdown(f"**{label}**")
-    c2.write(mc_value)
-    c3.write(miser_value)
-
-
-# ----------------------------- UI -----------------------------
-
-st.title("📊 Monte Carlo vs MISER")
-st.caption(
-    "An interactive comparison of uniform Monte Carlo sampling "
-    "and variance-guided adaptive subdivision."
-)
-
-with st.sidebar:
-    st.header("Experiment settings")
-    sample_count = st.slider(
-        "Function evaluation budget (per algorithm)",
-        min_value=2000,
-        max_value=20000,
-        value=10000,
-        step=1000,
-    )
-    leaf_size = st.slider(
-        "MISER leaf sample threshold",
-        min_value=100,
-        max_value=800,
-        value=300,
-        step=50,
-        help="Smaller values create deeper subdivision; larger values stop recursion earlier.",
-    )
-    frame_count = st.slider(
-        "Animation frames",
-        min_value=15,
-        max_value=60,
-        value=35,
-        step=5,
-    )
-    animation_speed = st.select_slider(
-        "Animation speed",
-        options=["Slow", "Normal", "Fast"],
-        value="Normal",
-    )
-    speed_ms = {"Slow": 350, "Normal": 180, "Fast": 70}[animation_speed]
-    seed = st.number_input("Random seed", min_value=0, max_value=999999, value=42)
-    run_button = st.button("▶ Run comparison", type="primary", use_container_width=True)
-    reset_button = st.button("↻ Reset results", use_container_width=True)
-
-if reset_button:
-    st.session_state.pop("results", None)
-    st.rerun()
-
+st.set_page_config(page_title="Monte Carlo vs MISER", page_icon="📊", layout="wide")
 st.markdown(
     """
-    **Model:** a unit-square region containing a circular village centered at
-    `(0.70, 0.30)` with radius `0.15`. The density is highest near the village.
-    Both algorithms receive the same function-evaluation budget.
-    """
+    <style>
+    div[data-testid="stMetric"] {
+        border: 1px solid rgba(128,128,128,0.25);
+        border-radius: 10px; padding: 8px 12px;
+    }
+    div[data-testid="stMetricValue"] { font-size: 1.45rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-if run_button:
-    progress = st.progress(0, text="Preparing parallel execution...")
-    start_parallel = time.perf_counter()
+st.title("Monte Carlo vs MISER Integration")
+st.caption("Interactive Visualization and Performance Comparison of "
+           "Monte Carlo Integration Algorithms")
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        future_mc = pool.submit(
-            run_plain_monte_carlo, sample_count, int(seed)
+# ============================================================ sidebar
+with st.sidebar:
+    st.header("Experiment Settings")
+    n_samples = st.number_input(
+        "Number of Samples", min_value=1_000, max_value=100_000,
+        value=10_000, step=1_000,
+        help="Total function-evaluation budget given to EACH algorithm. "
+             "MISER's pilot (variance-estimation) samples are included.",
+    )
+    seed = st.number_input("Random Seed", min_value=0, max_value=999_999,
+                           value=42, step=1)
+    with st.expander("Advanced"):
+        leaf_size = st.slider(
+            "MISER leaf sample threshold", 100, 800, 300, 50,
+            help="A region stops splitting when its budget is at most "
+                 "2 × threshold + pilot cost. Smaller values → deeper recursion.",
         )
-        future_miser = pool.submit(
-            run_miser, sample_count, int(seed) + 1, leaf_size
-        )
-
-        progress.progress(25, text="Both algorithms are running...")
-        mc_result = future_mc.result()
-        progress.progress(75, text="Building comparison results...")
-        miser_result = future_miser.result()
-
-    parallel_wall_time = time.perf_counter() - start_parallel
-    progress.progress(100, text="Experiment completed.")
-    progress.empty()
-
-    st.session_state["results"] = {
-        "mc": mc_result,
-        "miser": miser_result,
-        "n": sample_count,
-        "leaf_size": leaf_size,
-        "frame_count": frame_count,
-        "speed_ms": speed_ms,
-        "seed": int(seed),
-        "parallel_wall_time": parallel_wall_time,
-    }
-
-if "results" not in st.session_state:
-    st.info(
-        "Set the experiment options in the sidebar and click "
-        "**Run comparison** to generate the results and animation."
+    run_clicked = st.button("Run Comparison", type="primary", width="stretch")
+    st.caption(
+        f"Target: circle centred at ({CX:.2f}, {CY:.2f}) with r = {R:.2f} in the "
+        f"unit square. f(x, y) = 1 if (x − {CX:.2f})² + (y − {CY:.2f})² ≤ {R:.2f}², "
+        f"else 0, so the integral is the circle's area πr² = {REFERENCE:.6f}. "
+        f"The animation replays each run in about {live.PLAYBACK_SECONDS} s."
     )
 
-    st.subheader("What you will see")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### 🔵 Plain Monte Carlo")
-        st.write("Random points are distributed uniformly across the entire square.")
-    with col2:
-        st.markdown("### 🟠 MISER")
-        st.write(
-            "Pilot samples estimate regional variance. MISER recursively "
-            "subdivides the region and allocates the remaining samples."
-        )
+settings = (int(n_samples), int(seed), int(leaf_size))
+
+# ============================================================ run
+if run_clicked:
+    with st.spinner("Running Plain Monte Carlo and MISER..."):
+        mc, ms = run_pair(CIRCLE, BOUNDS, int(n_samples), int(seed), int(leaf_size))
+        sweep_rows = sweep(CIRCLE, BOUNDS, int(seed), int(leaf_size))
+    run_id = st.session_state.get("run_counter", 0) + 1
+    st.session_state["run_counter"] = run_id
+    st.session_state["run"] = {
+        "settings": settings, "mc": mc, "ms": ms, "sweep": sweep_rows,
+        "run_id": run_id,
+        "payload": live.build_payload(run_id, CIRCLE, mc, ms, REFERENCE),
+    }
+    st.session_state.pop("repeated", None)
+
+run = st.session_state.get("run")
+
+if run and run["settings"] != settings:
+    st.warning("Sidebar settings changed since the last run. The animation and "
+               "statistics still show the previous run — click **Run Comparison** "
+               "to apply the new settings.")
+
+# ============================================================ animation (top)
+payload = run["payload"] if run else live.blank_payload(CIRCLE.circle, REFERENCE)
+finished_id = live.live_sampling(payload)
+if run and finished_id == run["run_id"]:
+    st.session_state["anim_done"] = run["run_id"]
+
+if run is None:
+    st.info("Set the number of samples in the sidebar and click **Run Comparison**. "
+            "Both algorithms then start dropping points into the square at the same "
+            "time; points inside the circle are counted live.")
     st.stop()
 
-results = st.session_state["results"]
-mc = results["mc"]
-miser = results["miser"]
-n = results["n"]
+done = st.session_state.get("anim_done") == run["run_id"]
 
-# Reference calculation is independent of the randomized algorithms.
-truth = reference_integral()
-mc_abs_error = abs(mc["estimate"] - truth)
-miser_abs_error = abs(miser["estimate"] - truth)
-mc_rel_error = mc_abs_error / abs(truth) * 100
-miser_rel_error = miser_abs_error / abs(truth) * 100
+# ============================================================ statistics (bottom)
+st.header("Comparison Statistics")
+if not done:
+    st.info("Sampling in progress… the final statistics appear here as soon as the "
+            "animation finishes.")
+    st.stop()
 
-st.subheader("1. Execution time")
-t1, t2, t3 = st.columns(3)
-t1.metric("Plain Monte Carlo", f"{mc['elapsed']:.5f} s")
-t2.metric("MISER", f"{miser['elapsed']:.5f} s")
-t3.metric("Parallel wall time", f"{results['parallel_wall_time']:.5f} s")
+r_n, r_seed, r_leaf = run["settings"]
+mc, ms = run["mc"], run["ms"]
+mc_abs, mc_rel = errors(mc["estimate"], REFERENCE)
+ms_abs, ms_rel = errors(ms["estimate"], REFERENCE)
+mc_in = int(mc["values"].sum())
+ms_in = int(ms["values"].sum())
+ms_pilot = int((ms["kinds"] == 0).sum())
+ms_in_prod = int(ms["values"][ms["kinds"] == 1].sum())
+ms_depth = max(nd["depth"] for nd in ms["nodes"])
+ms_leaves = sum(nd["leaf"] for nd in ms["nodes"])
 
-st.caption(
-    "The two individual times measure each algorithm's computation. "
-    "The parallel wall time measures the elapsed time for the concurrent run. "
-    "Animation playback time is not included."
-)
+c_mc, c_ms = st.columns(2)
+with c_mc:
+    st.markdown('<h4 style="color:#1f77b4">Plain Monte Carlo</h4>', unsafe_allow_html=True)
+    a = st.columns(4)
+    a[0].metric("Final estimate", f"{mc['estimate']:.6f}")
+    a[1].metric("Absolute error", f"{mc_abs:.2e}")
+    a[2].metric("Relative error", f"{mc_rel * 100:.3f} %")
+    a[3].metric("Execution time", f"{mc['elapsed'] * 1000:.2f} ms")
+    b = st.columns(4)
+    b[0].metric("Total samples", f"{mc['evaluations']:,}")
+    b[1].metric("Inside circle", f"{mc_in:,}")
+    b[2].metric("Inside ratio", f"{100 * mc_in / mc['evaluations']:.2f} %")
+    b[3].metric("Pilot samples", "0",
+                help="Plain MC has no pilot phase: area = (inside / total) × 1.")
+with c_ms:
+    st.markdown('<h4 style="color:#ff7f0e">MISER Algorithm</h4>', unsafe_allow_html=True)
+    a = st.columns(4)
+    a[0].metric("Final estimate", f"{ms['estimate']:.6f}")
+    a[1].metric("Absolute error", f"{ms_abs:.2e}",
+                delta=f"{ms_abs - mc_abs:+.1e}", delta_color="inverse",
+                help="Delta = MISER − Plain MC (negative is better).")
+    a[2].metric("Relative error", f"{ms_rel * 100:.3f} %")
+    a[3].metric("Execution time", f"{ms['elapsed'] * 1000:.2f} ms",
+                delta=f"{(ms['elapsed'] - mc['elapsed']) * 1000:+.1f} ms",
+                delta_color="inverse",
+                help="Delta = MISER − Plain MC (negative is faster).")
+    b = st.columns(4)
+    b[0].metric("Total samples", f"{ms['evaluations']:,}",
+                help=f"Includes {ms_pilot:,} pilot samples.")
+    b[1].metric("Inside circle", f"{ms_in:,}")
+    b[2].metric("Inside ratio", f"{100 * ms_in / ms['evaluations']:.2f} %",
+                help="Not the MISER estimate: MISER samples non-uniformly.")
+    b[3].metric("Splits / depth", f"{len(ms['splits'])} / {ms_depth}",
+                help="Region splits / maximum recursion depth.")
 
-st.subheader("2. Synchronized sampling animation")
-st.write(
-    "Use **Start / Resume** and **Pause** inside the chart. "
-    "The slider lets you inspect a particular sampling stage. "
-    "Both panels advance together."
-)
-
-fig = make_animated_figure(
-    mc,
-    miser,
-    n,
-    results["frame_count"],
-    results["speed_ms"],
-)
-st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
-
-st.subheader("3. Accuracy and sampling comparison")
-
-mc_village_pct = float(np.mean(in_village(mc["points"])) * 100)
-miser_village_pct = float(np.mean(in_village(miser["points"])) * 100)
-
-st.markdown("| Metric | Plain Monte Carlo | MISER |")
-st.markdown("|:--|--:|--:|")
-st.markdown(
-    f"| Function evaluations | {len(mc['points']):,} | {len(miser['points']):,} |"
-)
-st.markdown(
-    f"| Estimated integral | {mc['estimate']:.7f} | {miser['estimate']:.7f} |"
-)
-st.markdown(
-    f"| Absolute error | {mc_abs_error:.7f} | {miser_abs_error:.7f} |"
-)
-st.markdown(
-    f"| Relative error | {mc_rel_error:.4f}% | {miser_rel_error:.4f}% |"
-)
-st.markdown(
-    f"| Samples inside village | {mc_village_pct:.2f}% | {miser_village_pct:.2f}% |"
-)
-st.markdown(
-    f"| MISER subdivision count | — | {len(miser['splits']):,} |"
-)
-
-st.subheader("4. Interpretation")
-if miser_rel_error < mc_rel_error:
-    st.success(
-        "In this run, MISER produced a smaller relative error under the same "
-        "function-evaluation budget."
+t1, t2 = st.columns([1.15, 1])
+with t1:
+    st.dataframe(
+        [
+            {"Metric": "Final estimate (circle area)",
+             "Plain Monte Carlo": f"{mc['estimate']:.6f}", "MISER": f"{ms['estimate']:.6f}"},
+            {"Metric": "Reference value (πr²)",
+             "Plain Monte Carlo": f"{REFERENCE:.6f}", "MISER": f"{REFERENCE:.6f}"},
+            {"Metric": "Absolute error",
+             "Plain Monte Carlo": f"{mc_abs:.3e}", "MISER": f"{ms_abs:.3e}"},
+            {"Metric": "Relative error",
+             "Plain Monte Carlo": f"{mc_rel * 100:.3f} %", "MISER": f"{ms_rel * 100:.3f} %"},
+            {"Metric": "Execution time (algorithm only)",
+             "Plain Monte Carlo": f"{mc['elapsed'] * 1000:.3f} ms",
+             "MISER": f"{ms['elapsed'] * 1000:.3f} ms"},
+            {"Metric": "Total samples",
+             "Plain Monte Carlo": f"{mc['evaluations']:,}",
+             "MISER": f"{ms['evaluations']:,} (pilot {ms_pilot:,})"},
+            {"Metric": "Samples inside circle",
+             "Plain Monte Carlo": f"{mc_in:,}",
+             "MISER": f"{ms_in:,} (production {ms_in_prod:,})"},
+            {"Metric": "Inside ratio",
+             "Plain Monte Carlo": f"{100 * mc_in / mc['evaluations']:.2f} %",
+             "MISER": f"{100 * ms_in / ms['evaluations']:.2f} %"},
+            {"Metric": "How the area is computed",
+             "Plain Monte Carlo": "inside / total × 1",
+             "MISER": "Σ region area × fraction"},
+            {"Metric": "Region splits / max depth / leaf regions",
+             "Plain Monte Carlo": "—",
+             "MISER": f"{len(ms['splits'])} / {ms_depth} / {ms_leaves}"},
+        ],
+        hide_index=True,
     )
-elif miser_rel_error > mc_rel_error:
-    st.info(
-        "In this run, Plain Monte Carlo produced a smaller relative error. "
-        "Adaptive sampling does not guarantee a better result in every random run."
-    )
-else:
-    st.info("Both methods produced the same relative error in this run.")
+with t2:
+    st.plotly_chart(plots.final_comparison_figure(mc_abs, ms_abs, mc["elapsed"],
+                                                  ms["elapsed"]),
+                    config={"displaylogo": False}, key="final-bars")
 
+more_acc = "MISER" if ms_abs < mc_abs else "Plain Monte Carlo"
+faster = "MISER" if ms["elapsed"] < mc["elapsed"] else "Plain Monte Carlo"
 st.caption(
-    "Important: this is a MISER-style educational implementation, not a "
-    "bit-for-bit reproduction of a specific MISER library. Pilot evaluations "
-    "are included in the evaluation budget; the independent leaf samples "
-    "form the recursive integral estimate. The village sample percentage "
-    "counts all evaluated points, including pilot samples."
+    f"In this run, **{more_acc}** was closer to the true area and **{faster}** "
+    "computed faster. MISER concentrates samples in the regions around the "
+    "circle (where the indicator changes and the variance is high), but it also "
+    "spends part of the budget on pilot samples, and a pilot that misses the small "
+    "circle reports zero variance, so whether the concentration pays off depends on "
+    "the problem and budget. One random run cannot decide which method is better — "
+    "see *Error analysis → Repeated experiments* for RMSE over many runs. "
+    "Execution time is measured inside each algorithm and "
+    "excludes the animation; the original MISER code also re-evaluates f once at "
+    "the end for its returned values, which is included in its time."
 )
+
+# ============================================================ more analysis
+st.subheader("More analysis")
+rows = run["sweep"]
+tab_conv, tab_err, tab_perf, tab_part, tab_about = st.tabs([
+    "Convergence", "Error analysis", "Performance", "MISER partition",
+    "About the algorithms"])
+
+with tab_conv:
+    st.plotly_chart(plots.convergence_figure(rows, REFERENCE),
+                    config={"displaylogo": False}, key="conv")
+    st.caption("One independent run of each algorithm at every sample size "
+               f"({', '.join(f'{n:,}' for n in SWEEP_SIZES)}), same seeds as the "
+               "main run. Single runs fluctuate randomly.")
+
+with tab_err:
+    st.plotly_chart(plots.error_figure(rows), config={"displaylogo": False}, key="err")
+    st.markdown("**Repeated experiments**")
+    sweep_time = sum(r["time"] for r in rows)
+    ra, rb = st.columns([1, 2])
+    with ra:
+        repeats = st.select_slider("Repetitions per sample size",
+                                   options=[5, 10, 20], value=10)
+        st.caption(f"Cost: {repeats} × {len(SWEEP_SIZES)} sizes × 2 algorithms = "
+                   f"**{repeats * len(SWEEP_SIZES) * 2} runs**, roughly "
+                   f"{repeats * sweep_time:.1f} s of compute.")
+        rep_clicked = st.button("Run Repeated Experiments")
+    if rep_clicked:
+        with st.spinner("Running repeated experiments..."):
+            st.session_state["repeated"] = {
+                "settings": run["settings"], "repeats": repeats,
+                "rows": repeated(CIRCLE, BOUNDS, r_seed, r_leaf, repeats),
+            }
+    rep = st.session_state.get("repeated")
+    if rep and rep["settings"] == run["settings"]:
+        rrows = rep["rows"]
+        st.success(f"{rep['repeats']} independent runs per sample size "
+                   "(different seeds from the single run).")
+        g1, g2 = st.columns(2)
+        g1.plotly_chart(plots.repeated_figure(rrows, "rmse", "RMSE vs number of samples",
+                                              "RMSE (log)"),
+                        config={"displaylogo": False}, key="rmse")
+        g2.plotly_chart(plots.repeated_figure(rrows, "std", "Std. deviation of estimates",
+                                              "Standard deviation (log)"),
+                        config={"displaylogo": False}, key="std")
+        st.dataframe(
+            [{
+                "Algorithm": r["algorithm"], "Samples": r["n"],
+                "Mean estimate": f"{r['mean_estimate']:.6f}",
+                "Mean Absolute Error": f"{r['mae']:.3e}",
+                "RMSE": f"{r['rmse']:.3e}",
+                "Std of estimates": f"{r['std']:.3e}",
+                "Mean time (ms)": f"{r['mean_time'] * 1000:.3f}",
+            } for r in sorted(rrows, key=lambda r: (r["n"], r["algorithm"]))],
+            hide_index=True,
+        )
+    else:
+        with rb:
+            st.info("Optional: compute Mean Absolute Error, RMSE and the standard "
+                    "deviation over independent runs.")
+
+with tab_perf:
+    rep = st.session_state.get("repeated")
+    has_rep = bool(rep and rep["settings"] == run["settings"])
+    p1, p2 = st.columns(2)
+    with p1:
+        fig = (plots.time_figure(rep["rows"], key="mean_time",
+                                 title=f"Mean execution time ({rep['repeats']} runs)")
+               if has_rep else plots.time_figure(rows))
+        st.plotly_chart(fig, config={"displaylogo": False}, key="time")
+    with p2:
+        fig = (plots.accuracy_time_figure(rep["rows"], "mean_time", "rmse",
+                                          "Accuracy vs execution time (repeated)",
+                                          "RMSE (log)")
+               if has_rep else
+               plots.accuracy_time_figure(rows, "time", "abs_error",
+                                          "Accuracy vs execution time (single run)",
+                                          "Absolute error (log)"))
+        st.plotly_chart(fig, config={"displaylogo": False}, key="acc-time")
+    st.caption("Further down-left is better (lower error for less time). "
+               + ("Based on repeated experiments." if has_rep else
+                  "Single runs — run the repeated experiments for RMSE."))
+
+with tab_part:
+    nodes = ms["nodes"]
+    depth_names = {0: "Initial Region", 1: "First Split", 2: "Recursive Subdivision"}
+    labels = [f"Depth {d}: {depth_names.get(d, 'Further Subdivision')}"
+              for d in range(ms_depth + 1)]
+    if ms_depth == 0:
+        st.info("MISER did not split the region in this run (budget too small for "
+                "the leaf threshold).")
+        depth = 0
+    else:
+        depth = labels.index(st.select_slider("Recursion depth to display",
+                                              options=labels,
+                                              value=labels[min(3, ms_depth)]))
+    regions = regions_at_depth(nodes, depth)
+    max_density = max(nd["count"] / ((nd["box"][0][1] - nd["box"][0][0])
+                                     * (nd["box"][1][1] - nd["box"][1][0]))
+                      for nd in regions)
+    q1, q2 = st.columns([1.6, 1])
+    with q1:
+        st.plotly_chart(plots.partition_figure_2d(regions, max_density, CIRCLE.circle),
+                        config={"displaylogo": False}, key="part")
+        st.caption("Each rectangle is an actual MISER recursive call. Shade = samples "
+                   "allocated per unit area, relative to the densest region at this "
+                   "depth. Hover for the allocated samples and pilot variance.")
+    with q2:
+        st.plotly_chart(plots.depth_summary_figure(nodes),
+                        config={"displaylogo": False}, key="depthsum")
+
+with tab_about:
+    ab1, ab2 = st.columns(2)
+    with ab1:
+        st.markdown(
+            """
+            **Plain Monte Carlo**
+            - Drops points **uniformly** over the whole square.
+            - Area ≈ (points inside / all points) × square area.
+            - Error shrinks like **1/√N**; no adaptation, minimal overhead.
+            """)
+    with ab2:
+        st.markdown(
+            """
+            **MISER (recursive stratified sampling)**
+            - **Recursively bisects** the square along the more useful axis.
+            - Uses a few **pilot samples** to estimate each half's variance.
+            - Gives **more samples to the higher-variance half**: for a circle,
+              the regions crossing its edge.
+            - Area = Σ region area × inside-fraction in that region.
+            - Not guaranteed to win every run or every problem.
+            """)
+    mc_seed, miser_seed = seeds_for(r_seed)
+    st.caption(f"Run settings: {r_n:,} samples per algorithm, seeds {mc_seed} (MC) / "
+               f"{miser_seed} (MISER), leaf threshold {r_leaf}.")
