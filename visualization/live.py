@@ -49,12 +49,22 @@ def _empty_algo():
     return {"x": [], "y": [], "v": [], "elapsed": 0.0, "estimate": 0.0}
 
 
+# 원이 없는·연속값 시나리오도 보내기 위해 추가
+def _overlay(circle):
+    return list(circle) if circle is not None else None
+
+
+def _values(res, binary):
+    return (res["values"].astype(int).tolist() if binary
+            else _r(res["values"], 5))
+
+
 def blank_payload(circle, reference):
     """Idle state before the first run: only the square and the circle."""
-    cx, cy, r = circle
     ms = _empty_algo()
     ms.update(kind=[], leaves=[], splits=[], nodes=[])
-    return {"run_id": 0, "n": 0, "circle": [cx, cy, r], "reference": reference,
+    return {"run_id": 0, "n": 0, "circle": _overlay(circle), "binary": True,
+            "vmax": 1.0, "heat": [], "reference": reference,
             "seconds": PLAYBACK_SECONDS, "mc": _empty_algo(), "ms": ms}
 
 
@@ -62,7 +72,8 @@ def build_payload(run_id, integrand, mc, ms, reference):
     """Serialize the real circle-indicator runs for the browser animation."""
     n = int(mc["evaluations"])
     assert n == ms["evaluations"]
-    cx, cy, r = integrand.circle
+    binary = bool(integrand.area_mode)
+    vmax = float(max(mc["values"].max(), ms["values"].max(), 1e-12))
 
     leaves = []
     for nd in sorted((nd for nd in ms["nodes"] if nd["leaf"]),
@@ -79,24 +90,38 @@ def build_payload(run_id, integrand, mc, ms, reference):
             seg = [ev["midpoint"], by0, ev["midpoint"], by1]
         else:
             seg = [bx0, ev["midpoint"], bx1, ev["midpoint"]]
-        splits.append([ev["after_eval"]] + seg + [ev["depth"]])
+        # 분할할 때 % 비율을 보여주기 위해 추가
+        share_left = ev["n_left"] / max(ev["n_left"] + ev["n_right"], 1)
+        splits.append([ev["after_eval"]] + seg + [ev["depth"], ev["axis"],
+                                                  bx0, bx1, by0, by1, share_left])
 
     nodes = sorted([nd["eval_at_create"], nd["depth"]] for nd in ms["nodes"])
+
+    # 배경 히트맵을 그리기 위해 추가
+    heat = []
+    if ms.get("dim") == 2:
+        g = np.linspace(0.0, 1.0, 100)
+        gx, gy = np.meshgrid(g, g)
+        h = integrand.func(np.column_stack([gx.ravel(), gy.ravel()])).reshape(gx.shape)
+        heat = _r(h / max(float(np.max(np.abs(h))), 1e-12), 3)
 
     return {
         "run_id": run_id,
         "n": n,
-        "circle": [cx, cy, r],
+        "circle": _overlay(integrand.circle),
+        "binary": binary,
+        "vmax": vmax,
+        "heat": heat,
         "reference": reference,
         "seconds": PLAYBACK_SECONDS,
         "mc": {
             "x": _r(mc["points"][:, 0]), "y": _r(mc["points"][:, 1]),
-            "v": mc["values"].astype(int).tolist(),
+            "v": _values(mc, binary),
             "elapsed": mc["elapsed"], "estimate": mc["estimate"],
         },
         "ms": {
             "x": _r(ms["points"][:, 0]), "y": _r(ms["points"][:, 1]),
-            "v": ms["values"].astype(int).tolist(),
+            "v": _values(ms, binary),
             "kind": ms["kinds"].astype(int).tolist(),
             "leaves": leaves, "splits": splits, "nodes": nodes,
             "elapsed": ms["elapsed"], "estimate": ms["estimate"],
